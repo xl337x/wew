@@ -1,3 +1,561 @@
+#Requires -Module ActiveDirectory
+
+<#
+.SYNOPSIS
+    Comprehensive AD ACL Attack Chain Discovery and Exploitation Tool
+    
+.DESCRIPTION
+    Combines ACL enumeration, DCSync detection, and exploitation command generation.
+    This is Part 1 of 2 - Contains core enumeration functions.
+    
+.PARAMETER Domain
+    Target domain (e.g., INLANEFREIGHT)
+    
+.PARAMETER StartUser
+    Starting user to enumerate from (e.g., wley)
+    
+.PARAMETER SkipDCSync
+    Skip DCSync enumeration (faster execution)
+    
+.EXAMPLE
+    .\AD-ACL-Tool-Part1.ps1 -Domain "INLANEFREIGHT" -StartUser "wley"
+#>
+
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$Domain,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$StartUser,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$SkipDCSync
+)
+
+# ============================================
+# GLOBAL VARIABLES AND INITIALIZATION
+# ============================================
+
+$script:DomainInfo = $null
+$script:AllUsers = $null
+$script:PasswordResetFindings = @()
+$script:GroupWriteFindings = @()
+$script:GenericAllFindings = @()
+$script:DCSyncFindings = @()
+$script:ControlledUsers = @()
+$script:NestedGroupFindings = @()
+$script:ReversibleUsers = @()
+
+# Replication GUIDs for DCSync
+$script:ReplicationGUIDs = @{
+    '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes'
+    '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes-All'
+    '89e95b76-444d-4c62-991a-0facbeda640c' = 'DS-Replication-Get-Changes-In-Filtered-Set'
+}
+
+# ============================================
+# FUNCTION: Initialize-DomainInfo
+# ============================================
+function Initialize-DomainInfo {
+    [CmdletBinding()]
+    param()
+    
+    try {
+        Write-Host "`n=== Initializing Domain Information ===" -ForegroundColor Cyan
+        
+        $script:DomainInfo = Get-ADDomain -ErrorAction Stop
+        $domainDN = $script:DomainInfo.DistinguishedName
+        $domainName = $script:DomainInfo.DNSRoot
+        $domainSID = $script:DomainInfo.DomainSID.Value
+        
+        Write-Host "[+] Domain: $domainName" -ForegroundColor Green
+        Write-Host "[+] Domain DN: $domainDN" -ForegroundColor Green
+        Write-Host "[+] Domain SID: $domainSID" -ForegroundColor Green
+        
+        # Get Domain Controllers
+        try {
+            $dcs = @((Get-ADDomainController -Filter * -ErrorAction Stop).HostName)
+            if ($dcs.Count -eq 0) {
+                throw "No DCs found via Get-ADDomainController"
+            }
+        } catch {
+            Write-Host "[-] Fallback DC detection..." -ForegroundColor Yellow
+            $dcs = @((nslookup -type=SRV "_ldap._tcp.dc._msdcs.$domainName" 2>$null | 
+                      Select-String "internet address" | 
+                      ForEach-Object { ($_ -split 'internet address = ')[1].Trim() }) | 
+                      Select-Object -First 1)
+        }
+        
+        $primaryDC = $dcs[0]
+        Write-Host "[+] Primary DC: $primaryDC" -ForegroundColor Green
+        
+        # Store in script scope
+        Add-Member -InputObject $script:DomainInfo -NotePropertyName 'PrimaryDC' -NotePropertyValue $primaryDC -Force
+        Add-Member -InputObject $script:DomainInfo -NotePropertyName 'DomainControllers' -NotePropertyValue $dcs -Force
+        
+        return $true
+    } catch {
+        Write-Host "[-] Error initializing domain info: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
+# ============================================
+# FUNCTION: Get-AllDomainUsers
+# ============================================
+function Get-AllDomainUsers {
+    [CmdletBinding()]
+    param()
+    
+    try {
+        Write-Host "`n=== Enumerating Domain Users ===" -ForegroundColor Cyan
+        
+        $script:AllUsers = Get-ADUser -Filter * -Properties sAMAccountName, Enabled, UserAccountControl, `
+            DistinguishedName, MemberOf, PasswordLastSet, LastLogonDate, SID, Department, Title, `
+            EmailAddress, Created, Description -ErrorAction Stop
+        
+        $enabledCount = ($script:AllUsers | Where-Object {$_.Enabled}).Count
+        
+        Write-Host "[+] Total users found: $($script:AllUsers.Count)" -ForegroundColor Green
+        Write-Host "[+] Enabled users: $enabledCount" -ForegroundColor Green
+        
+        # Save to file for reference
+        $script:AllUsers | Select-Object -ExpandProperty SamAccountName | 
+            Out-File "ad_users_temp.txt" -ErrorAction SilentlyContinue
+        
+        return $true
+    } catch {
+        Write-Host "[-] Error enumerating users: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
+# ============================================
+# FUNCTION: Test-ReversibleEncryption
+# ============================================
+function Test-ReversibleEncryption {
+    [CmdletBinding()]
+    param()
+    
+    Write-Host "`n=== Checking for Reversible Encryption ===" -ForegroundColor Cyan
+    
+    foreach ($user in $script:AllUsers) {
+        $uac = $user.UserAccountControl
+        $isReversible = ($uac -band 0x0080) -ne 0
+        
+        if ($isReversible) {
+            Write-Host "[!] Reversible encryption: $($user.sAMAccountName)" -ForegroundColor Red
+            
+            $script:ReversibleUsers += [PSCustomObject]@{
+                Username = $user.sAMAccountName
+                DN = $user.DistinguishedName
+                Enabled = $user.Enabled
+                SID = $user.SID.Value
+            }
+        }
+    }
+    
+    if ($script:ReversibleUsers.Count -gt 0) {
+        Write-Host "[+] Found $($script:ReversibleUsers.Count) users with reversible encryption" -ForegroundColor Yellow
+    } else {
+        Write-Host "[+] No reversible encryption users found" -ForegroundColor Green
+    }
+}
+
+# ============================================
+# FUNCTION: Find-DCSync
+# ============================================
+function Find-DCSync {
+    [CmdletBinding()]
+    param()
+    
+    if ($SkipDCSync) {
+        Write-Host "`n[*] Skipping DCSync enumeration (SkipDCSync flag set)" -ForegroundColor Yellow
+        return
+    }
+    
+    Write-Host "`n=== Checking for DCSync Rights ===" -ForegroundColor Cyan
+    
+    try {
+        $domainDN = $script:DomainInfo.DistinguishedName
+        $domainACL = Get-Acl "AD:\$domainDN" -ErrorAction Stop
+        
+        foreach ($user in $script:AllUsers) {
+            $username = $user.sAMAccountName
+            
+            $matches = $domainACL.Access | Where-Object {
+                $_.IdentityReference -like "*\$username" -and
+                $_.ObjectType -in $script:ReplicationGUIDs.Keys -and
+                $_.ActiveDirectoryRights -match "ExtendedRight"
+            }
+            
+            if ($matches) {
+                $rights = $matches | ForEach-Object { $script:ReplicationGUIDs[$_.ObjectType.ToString()] }
+                $rightsStr = $rights -join ', '
+                
+                Write-Host "[!] DCSync rights: $username" -ForegroundColor Red
+                Write-Host "    Rights: $rightsStr" -ForegroundColor DarkRed
+                
+                # Check if also has reversible encryption
+                $isReversible = $script:ReversibleUsers | Where-Object { $_.Username -eq $username }
+                
+                $script:DCSyncFindings += [PSCustomObject]@{
+                    Username = $username
+                    Rights = $rightsStr
+                    Enabled = $user.Enabled
+                    Reversible = [bool]$isReversible
+                    DN = $user.DistinguishedName
+                    SID = $user.SID.Value
+                    UserObject = $user
+                }
+            }
+        }
+        
+        Write-Host "[+] Found $($script:DCSyncFindings.Count) users with DCSync rights" -ForegroundColor $(if ($script:DCSyncFindings.Count -gt 0) { "Red" } else { "Green" })
+        
+    } catch {
+        Write-Host "[-] Error checking DCSync rights: $_" -ForegroundColor Red
+    }
+}
+
+# ============================================
+# FUNCTION: Resolve-ExtendedRight
+# ============================================
+function Resolve-ExtendedRight {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ObjectType
+    )
+    
+    if ($ObjectType -eq '00000000-0000-0000-0000-000000000000') {
+        return "Standard Right"
+    }
+    
+    if ($ObjectType -eq '00299570-246d-11d0-a768-00aa006e0529') {
+        return "User-Force-Change-Password"
+    }
+    
+    try {
+        $configNC = (Get-ADRootDSE).ConfigurationNamingContext
+        $right = Get-ADObject -SearchBase "CN=Extended-Rights,$configNC" `
+                              -Filter {ObjectClass -like 'ControlAccessRight' -and rightsGuid -eq $ObjectType} `
+                              -Properties DisplayName -ErrorAction Stop | 
+                              Select-Object -ExpandProperty DisplayName
+        
+        if ($right) {
+            return $right
+        } else {
+            return "GUID: $ObjectType"
+        }
+    } catch {
+        return "GUID: $ObjectType"
+    }
+}
+
+# ============================================
+# FUNCTION: Get-UserACLRights
+# ============================================
+function Get-UserACLRights {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$TargetUser,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$CheckingUser,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Domain
+    )
+    
+    try {
+        $targetUserObj = Get-ADUser $TargetUser -ErrorAction Stop
+        $acls = Get-Acl "AD:\$($targetUserObj.DistinguishedName)" -ErrorAction Stop | 
+                Select-Object -ExpandProperty Access | 
+                Where-Object {$_.IdentityReference -match "$Domain\\$CheckingUser"}
+        
+        return $acls
+    } catch {
+        Write-Host "[-] Error getting ACL for $TargetUser : $_" -ForegroundColor Red
+        return $null
+    }
+}
+
+# ============================================
+# FUNCTION: Enumerate-StartUserRights
+# ============================================
+function Enumerate-StartUserRights {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$StartUser,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Domain
+    )
+    
+    Write-Host "`n=== Enumerating Rights for: $StartUser ===" -ForegroundColor Cyan
+    
+    $userList = Get-Content "ad_users_temp.txt" -ErrorAction SilentlyContinue
+    
+    if (-not $userList) {
+        Write-Host "[-] User list not found. Re-enumerating..." -ForegroundColor Yellow
+        Get-AllDomainUsers
+        $userList = Get-Content "ad_users_temp.txt"
+    }
+    
+    $totalUsers = $userList.Count
+    $current = 0
+    
+    foreach ($targetUser in $userList) {
+        $current++
+        
+        if ($current % 50 -eq 0) {
+            Write-Progress -Activity "Checking ACLs" -Status "$current of $totalUsers" -PercentComplete (($current / $totalUsers) * 100)
+        }
+        
+        $acls = Get-UserACLRights -TargetUser $targetUser -CheckingUser $StartUser -Domain $Domain
+        
+        if (-not $acls) {
+            continue
+        }
+        
+        foreach ($acl in $acls) {
+            $resolvedRight = Resolve-ExtendedRight -ObjectType $acl.ObjectType
+            
+            # Check for password reset rights
+            if ($resolvedRight -match "User-Force-Change-Password") {
+                Write-Host "`n[+] Password Reset Right Found!" -ForegroundColor Green
+                Write-Host "    $StartUser -> $targetUser" -ForegroundColor Yellow
+                
+                $script:PasswordResetFindings += [PSCustomObject]@{
+                    Attacker = $StartUser
+                    Target = $targetUser
+                    Right = $resolvedRight
+                    Path = $acl.Path
+                }
+            }
+            
+            # Display detailed ACL info
+            Write-Host "`nPath                  : $($acl.Path)" -ForegroundColor Yellow
+            Write-Host "ActiveDirectoryRights : $($acl.ActiveDirectoryRights)"
+            Write-Host "ObjectType            : $($acl.ObjectType)"
+            Write-Host "IdentityReference     : $($acl.IdentityReference)"
+            Write-Host "Resolved Right        : $resolvedRight" -ForegroundColor Green
+            
+            # Add to controlled users list
+            if ($targetUser -notin $script:ControlledUsers) {
+                $script:ControlledUsers += $targetUser
+            }
+        }
+    }
+    
+    Write-Progress -Activity "Checking ACLs" -Completed
+    
+    if ($script:ControlledUsers.Count -eq 0) {
+        Write-Host "`n[-] No direct permissions found for $StartUser" -ForegroundColor Red
+        return $false
+    }
+    
+    Write-Host "`n=== SUMMARY ===" -ForegroundColor Magenta
+    Write-Host "$StartUser can control $($script:ControlledUsers.Count) user(s):" -ForegroundColor Yellow
+    $script:ControlledUsers | ForEach-Object { Write-Host "  - $_" -ForegroundColor Cyan }
+    
+    return $true
+}
+
+# ============================================
+# FUNCTION: Find-GroupRights
+# ============================================
+function Find-GroupRights {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ControlledUser,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Domain
+    )
+    
+    Write-Host "`n=== Enumerating Group Rights for: $ControlledUser ===" -ForegroundColor Cyan
+    
+    $targetGroups = @(
+        "Help Desk Level 1", "Help Desk", "Help Desk Level 2",
+        "Information Technology", "IT", "IT Support", "IT Admin",
+        "Domain Admins", "Enterprise Admins", "Administrators",
+        "Server Operators", "Account Operators", "Backup Operators"
+    )
+    
+    foreach ($groupName in $targetGroups) {
+        try {
+            $group = Get-ADGroup -Filter {Name -eq $groupName} -Properties nTSecurityDescriptor, MemberOf -ErrorAction SilentlyContinue
+            
+            if (-not $group) {
+                continue
+            }
+            
+            $objAcl = Get-Acl "AD:\$($group.DistinguishedName)" -ErrorAction Stop
+            $relevantACEs = $objAcl.Access | Where-Object { 
+                $_.IdentityReference -match "$Domain\\$ControlledUser"
+            }
+            
+            foreach ($ace in $relevantACEs) {
+                if ($ace.ActiveDirectoryRights -match "GenericWrite|GenericAll|WriteProperty|WriteDacl|WriteOwner") {
+                    
+                    Write-Host "`n[+] GROUP RIGHT FOUND!" -ForegroundColor Green
+                    Write-Host "    $ControlledUser has $($ace.ActiveDirectoryRights) over: $($group.Name)" -ForegroundColor Yellow
+                    
+                    $script:GroupWriteFindings += [PSCustomObject]@{
+                        Attacker = $ControlledUser
+                        GroupName = $group.Name
+                        Rights = $ace.ActiveDirectoryRights.ToString()
+                        GroupDN = $group.DistinguishedName
+                    }
+                    
+                    # Check group nesting
+                    Find-NestedGroups -Group $group -ControlledUser $ControlledUser -Domain $Domain
+                }
+            }
+        } catch {
+            # Silently continue
+        }
+    }
+}
+
+# ============================================
+# FUNCTION: Find-NestedGroups
+# ============================================
+function Find-NestedGroups {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        $Group,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$ControlledUser,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Domain
+    )
+    
+    try {
+        $groupMembership = $Group.MemberOf
+        
+        if (-not $groupMembership) {
+            return
+        }
+        
+        Write-Host "`n[+] Group Nesting Discovery for $($Group.Name):" -ForegroundColor Magenta
+        
+        foreach ($parentGroupDN in $groupMembership) {
+            $parentGroup = Get-ADGroup $parentGroupDN -Properties Name, MemberOf -ErrorAction Stop
+            $parentGroupName = $parentGroup.Name
+            
+            Write-Host "   $($Group.Name) -> $parentGroupName" -ForegroundColor Cyan
+            
+            $script:NestedGroupFindings += [PSCustomObject]@{
+                ChildGroup = $Group.Name
+                ParentGroup = $parentGroupName
+                Attacker = $ControlledUser
+            }
+            
+            # Check what the parent group can do
+            Find-ParentGroupRights -ParentGroup $parentGroup -ControlledUser $ControlledUser -Domain $Domain -ChildGroup $Group.Name
+        }
+    } catch {
+        Write-Host "   [-] Error checking group nesting: $_" -ForegroundColor DarkYellow
+    }
+}
+
+# ============================================
+# FUNCTION: Find-ParentGroupRights
+# ============================================
+function Find-ParentGroupRights {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        $ParentGroup,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$ControlledUser,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Domain,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$ChildGroup
+    )
+    
+    Write-Host "   Searching for users controlled by $($ParentGroup.Name)..." -ForegroundColor Gray
+    
+    # Search for IT/Admin users
+    $potentialUsers = @()
+    
+    try {
+        $itUsers = Get-ADUser -Filter {
+            Department -like "*IT*" -or 
+            Title -like "*Admin*" -or
+            Title -like "*Manager*"
+        } -Properties nTSecurityDescriptor -ErrorAction SilentlyContinue
+        
+        $adminUsers = Get-ADUser -Filter {
+            SamAccountName -like "*admin*" -or 
+            SamAccountName -like "*adm*" -or
+            SamAccountName -like "*svc*" -or
+            SamAccountName -like "*service*"
+        } -Properties nTSecurityDescriptor -ErrorAction SilentlyContinue
+        
+        $potentialUsers = ($itUsers + $adminUsers) | Select-Object -Unique
+        
+    } catch {
+        Write-Host "   [-] Error searching for users: $_" -ForegroundColor DarkYellow
+        return
+    }
+    
+    foreach ($user in $potentialUsers) {
+        try {
+            $userAcl = Get-Acl "AD:\$($user.DistinguishedName)" -ErrorAction Stop
+            $parentGroupRights = $userAcl.Access | Where-Object { 
+                $_.IdentityReference -eq "$Domain\$($ParentGroup.Name)"
+            }
+            
+            foreach ($right in $parentGroupRights) {
+                if ($right.ActiveDirectoryRights -match "GenericAll|WriteProperty|WriteDacl") {
+                    
+                    Write-Host "      [!] $($ParentGroup.Name) has $($right.ActiveDirectoryRights) over: $($user.SamAccountName)" -ForegroundColor Red
+                    
+                    $script:GenericAllFindings += [PSCustomObject]@{
+                        AttackerGroup = $ParentGroup.Name
+                        AttackerUser = $ControlledUser
+                        TargetUser = $user.SamAccountName
+                        Rights = $right.ActiveDirectoryRights.ToString()
+                        ViaNestedGroup = $ChildGroup
+                    }
+                }
+            }
+        } catch {
+            # Skip errors
+        }
+    }
+}
+
+Write-Host @"
+
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║     AD ACL Attack Chain Discovery & Exploitation Tool        ║
+║                        Part 1 of 2                           ║
+║                                                               ║
+║     Core Enumeration Functions Loaded                        ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+
+"@ -ForegroundColor Cyan
+
+Write-Host "[+] Part 1 loaded successfully" -ForegroundColor Green
+Write-Host "[*] Continue with Part 2 to load exploitation functions" -ForegroundColor Yellow
+
 # ============================================
 # AD ACL ATTACK CHAIN TOOL - PART 2
 # Exploitation and Reporting Functions
